@@ -78,12 +78,13 @@ impl Connection {
 
 struct ThreadS<'a> {
     connection: &'a Arc<PipeConnection>,
-    fdlock: &'a Arc<Mutex<()>>,
+    workload_rx: &'a crossbeam::channel::Receiver<(MessageHeader, Vec<u8>)>,
     wtc: &'a Arc<AtomicUsize>,
     quit: &'a Arc<AtomicBool>,
     methods: &'a Arc<HashMap<String, Box<dyn MethodHandler + Send + Sync>>>,
     res_tx: &'a MessageSender,
     control_tx: &'a SyncSender<()>,
+    cancel_rx: &'a crossbeam::channel::Receiver<()>,
     default: usize,
     min: usize,
     max: usize,
@@ -92,12 +93,13 @@ struct ThreadS<'a> {
 #[allow(clippy::too_many_arguments)]
 fn start_method_handler_thread(
     connection: Arc<PipeConnection>,
-    fdlock: Arc<Mutex<()>>,
+    workload_rx: crossbeam::channel::Receiver<(MessageHeader, Vec<u8>)>,
     wtc: Arc<AtomicUsize>,
     quit: Arc<AtomicBool>,
     methods: Arc<HashMap<String, Box<dyn MethodHandler + Send + Sync>>>,
     res_tx: MessageSender,
     control_tx: SyncSender<()>,
+    cancel_rx: crossbeam::channel::Receiver<()>,
     min: usize,
     max: usize,
 ) {
@@ -109,18 +111,7 @@ fn start_method_handler_thread(
                 break;
             }
 
-            let result;
-            {
-                let _guard = fdlock.lock().unwrap();
-                if quit.load(Ordering::SeqCst) {
-                    // notify the connection dealing main thread to stop.
-                    control_tx
-                        .send(())
-                        .unwrap_or_else(|err| trace!("Failed to send {:?}", err));
-                    break;
-                }
-                result = read_message(&connection);
-            }
+            let result = workload_rx.recv();
 
             if quit.load(Ordering::SeqCst) {
                 // notify the connection dealing main thread to stop.
@@ -146,21 +137,17 @@ fn start_method_handler_thread(
                     buf = y;
                 }
                 Err(x) => match x {
-                    Error::Socket(y) => {
-                        trace!("Socket error {}", y);
+                    crossbeam::channel::RecvError => {
+                        trace!("workload_rx recv error");
                         quit.store(true, Ordering::SeqCst);
-                        // the client connection would be closed and
+                        // the workload tx would be dropped and
                         // the connection dealing main thread would
                         // have exited.
                         control_tx
                             .send(())
                             .unwrap_or_else(|err| trace!("Failed to send {:?}", err));
-                        trace!("Socket error send control_tx");
+                        trace!("wrokload_rx recv error, send control_tx");
                         break;
-                    }
-                    _ => {
-                        trace!("Others error {:?}", x);
-                        continue;
                     }
                 },
             }
@@ -211,6 +198,7 @@ fn start_method_handler_thread(
             };
             let ctx = TtrpcContext {
                 fd: connection.id(),
+                cancel_rx: cancel_rx.clone(),
                 mh,
                 res_tx: res_tx.clone(),
                 metadata: context::from_pb(&req.metadata),
@@ -238,12 +226,13 @@ fn start_method_handler_threads(num: usize, ts: &ThreadS) {
         }
         start_method_handler_thread(
             ts.connection.clone(),
-            ts.fdlock.clone(),
+            ts.workload_rx.clone(),
             ts.wtc.clone(),
             ts.quit.clone(),
             ts.methods.clone(),
             ts.res_tx.clone(),
             ts.control_tx.clone(),
+            ts.cancel_rx.clone(),
             ts.min,
             ts.max,
         );
@@ -421,16 +410,55 @@ impl Server {
                                 trace!("response thread quit");
                             });
 
-                            let pipe = pipe_connection_child.clone();
                             let (control_tx, control_rx): (SyncSender<()>, Receiver<()>) =
                                 sync_channel(0);
+
+                            // start read thread
+                            let quit_reader = child_quit.clone();
+                            let pipe = pipe_connection_child.clone();
+                            let (workload_tx, workload_rx) =
+                                crossbeam::channel::unbounded::<(MessageHeader, Vec<u8>)>();
+                            let (cancel_tx, cancel_rx) = crossbeam::channel::unbounded::<()>();
+                            let control_reader_tx = control_tx.clone();
+                            let reader = thread::spawn(move || {
+                                while !quit_reader.load(Ordering::SeqCst) {
+                                    let res = read_message(&pipe).and_then(|(x, y)| {
+                                        workload_tx
+                                            .send((x, y))
+                                            .map_err(|err| Error::Socket(err.to_string()))
+                                    });
+                                    match res {
+                                        Ok(()) => {}
+                                        Err(Error::Socket(x)) => {
+                                            trace!("Socket error {}", x);
+                                            drop(cancel_tx);
+                                            quit_reader.store(true, Ordering::SeqCst);
+                                            // the client connection would be closed and
+                                            // the connection dealing main thread would
+                                            // have exited.
+                                            control_reader_tx.send(()).unwrap_or_else(|err| {
+                                                trace!("Failed to send {:?}", err)
+                                            });
+                                            trace!("Socket error send control_tx");
+                                            break;
+                                        }
+                                        x => {
+                                            trace!("Other error {:?}", x);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            });
+
+                            let pipe = pipe_connection_child.clone();
                             let ts = ThreadS {
                                 connection: &pipe,
-                                fdlock: &Arc::new(Mutex::new(())),
+                                workload_rx: &workload_rx,
                                 wtc: &Arc::new(AtomicUsize::new(0)),
                                 methods: &methods,
                                 res_tx: &res_tx,
                                 control_tx: &control_tx,
+                                cancel_rx: &cancel_rx,
                                 quit: &child_quit,
                                 default,
                                 min,
@@ -450,6 +478,7 @@ impl Server {
                             // drop the res_tx, thus the res_rx would get terminated notification.
                             drop(res_tx);
                             handler.join().unwrap_or(());
+                            reader.join().unwrap_or(());
                             // client_handler should not close fd before exit
                             // , which prevent fd reuse issue.
                             reaper_tx_child.send(pipe.id()).unwrap();
